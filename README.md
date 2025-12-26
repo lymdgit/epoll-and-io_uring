@@ -369,11 +369,136 @@ success: 1000000, failed: 0, time_used: 9459, qps: 105719
 
 ### **1.三次握手、四次挥手**
 
+![《lwip学习10》-- TCP协议_lwip tcp-CSDN博客](https://ts1.tc.mm.bing.net/th/id/R-C.c765f0de97ceb8533dda25a71bfd7bcf?rik=DZJ%2bj6CDpR2qeQ&riu=http%3a%2f%2fs3.51cto.com%2fwyfs02%2fM02%2f76%2f24%2fwKiom1ZLIP2CRdNUAAlNCKgqwI0818.jpg&ehk=vJQqe4gJwt28JB2c77trQhMmRPBlEPCjttTGiQdUM7Q%3d&risl=&pid=ImgRaw&r=0)
+
+
+
 ![image-20251226142122280](C:\Users\27708\AppData\Roaming\Typora\typora-user-images\image-20251226142122280.png)
 
 
 
 ![image-20251226142147183](C:\Users\27708\AppData\Roaming\Typora\typora-user-images\image-20251226142147183.png)
+
+TCP 连接的建立需要解决两个核心问题：
+
+1. **确认双方的接收和发送能力都正常。**
+2. **同步双方的初始序列号 (ISN, Initial Sequence Number)。**
+
+过程如下：
+
+1. **SYN (Client -> Server)**:
+    - 客户端发送 `SYN=1`, `seq=x`。
+    - 含义：“我想建立连接，我的初始序列号是 x。”
+    - 状态：Client 进入 **SYN_SENT**。
+2. **SYN + ACK (Server -> Client)**:
+    - 服务端收到后，回复 `SYN=1`, `ACK=1`, `seq=y`, `ack=x+1`。
+    - 含义：“收到你的请求了（确认我知道 x 了），我也想建立连接，我的初始序列号是 y。”
+    - 状态：Server 进入 **SYN_RCVD**。
+3. **ACK (Client -> Server)**:
+    - 客户端回复 `ACK=1`, `seq=x+1`, `ack=y+1`。
+    - 含义：“收到，我知道你的序列号是 y了。”
+    - 状态：Client 进入 **ESTABLISHED**。服务端收到后也进入 **ESTABLISHED**。
+
+------
+
+### 二、 核心问题：为什么非要是三次？
+
+为什么 2 次不行？4 次不需要？
+
+#### 原因 1：为了防止“已失效的连接请求”突然又传到了服务端 (RFC 793 核心解释)
+
+**场景假设（如果是 2 次握手）：**
+
+1. 客户端发了第一个 `SYN A`，但是因为网络拥塞，它滞留了，没丢失。
+2. 客户端超时重传，发了第二个 `SYN B`。
+3. 服务端收到了 `SYN B`，回了 `ACK`，连接建立，数据传输，关闭连接。**一切正常。**
+4. **出事了**：连接结束后，那个滞留在网络里的 `SYN A` 终于慢吞吞地到了服务端。
+5. 服务端以为是新的连接请求，于是发回 `ACK`。
+6. **如果是 2 次握手**：服务端在发出 `ACK` 的瞬间，就认为连接建立成功了，开始等待客户端发数据，一直空耗资源。
+7. **如果是 3 次握手**：服务端发回 `SYN+ACK` 后，客户端收到发现：“不对啊，我没请求连接啊（或者这个 ack 号不对）”，于是发回一个 `RST` (Reset) 报文，服务端就知道不用建立了。
+
+#### 原因 2：为了验证全双工通道的通畅
+
+TCP 是全双工的（双向通道）。
+
+- **第 1 次** (Client -> Server)：Server 知道了：Client 能发，我能收。
+- **第 2 次** (Server -> Client)：Client 知道了：Server 能发，Server 能收，我能发，我能收。
+- **第 3 次** (Client -> Server)：Server 知道了：Client 能收，我能发。
+
+只有经过这 3 次，**双方都能确认对方的“收”和“发”能力是正常的**。
+
+- 如果是 2 次，Server 无法确认 Client 的接收能力是否正常。
+
+#### 原因 3：同步序列号
+
+TCP 是可靠传输，靠的就是序列号 (`seq`)。
+
+- C 告诉 S 自己的 `seq`。
+- S 告诉 C 自己的 `seq`。
+- 如果只有 2 次，S 怎么知道 C 真的收到了自己的 `seq` 呢？必须要有第 3 次 C 的 `ACK` 来确认 S 的序列号。
+
+------
+
+### 三、 四次挥手 (Four-Way Termination)
+
+#### 1. 流程解析
+
+断开连接比建立连接更复杂，因为 TCP 是 **全双工 (Full Duplex)** 的。这意味着：**我可以不给你发数据了，但我还可以接收你发的数据。** 这就是 **“半关闭” (Half-Close)** 状态。
+
+1. **FIN (Client -> Server)**:
+    - 客户端：“我没数据发了，我要关闭我这边的发送通道。”
+    - 状态：Client 进入 **FIN_WAIT_1**。
+2. **ACK (Server -> Client)**:
+    - 服务端：“知道了。”（此时 Client -> Server 通道关闭，但 Server 可能还有数据没传完）。
+    - 状态：Server 进入 **CLOSE_WAIT**，Client 收到后进入 **FIN_WAIT_2**。
+3. **Data Transfer... (Server -> Client)**:
+    - （这段时间 Server 继续把剩余的数据发给 Client，Client 依然在接收）。
+4. **FIN (Server -> Client)**:
+    - 服务端：“我也发完了，我也要关闭发送通道了。”
+    - 状态：Server 进入 **LAST_ACK**。
+5. **ACK (Client -> Server)**:
+    - 客户端：“好的，拜拜。”
+    - 状态：Client 进入 **TIME_WAIT**，等待 2MSL 后彻底关闭。Server 收到后进入 **CLOSED**。
+
+------
+
+### 四、 核心问题：为什么挥手要四次？
+
+握手的时候，`SYN` 和 `ACK` 是合并在一步（第2步）里发送的。为什么挥手的时候，`FIN` 和 `ACK` 不能合并？
+
+**答案：因为服务端有“处理时差”。**
+
+1. 当 Server 收到 Client 的 `FIN` 时，Server 协议栈必须立刻回一个 `ACK`（防止 Client 超时重传）。
+2. **但是**，Server 此时可能还有一堆数据堆在发送缓冲区里没发完，或者应用程序还没调用 `close()`。
+3. 所以 Server 只能先回 `ACK`（第2次挥手）。
+4. 等 Server 把剩下的数据发完了，应用程序真正调用 `close()` 了，才会发 `FIN`（第3次挥手）。
+5. 所以 `ACK` 和 `FIN` 分成了两步，导致总共需要 4 次。
+
+*注：如果 Server 在收到 FIN 时刚好也没数据要发了，且开启了某些优化，第 2、3 步偶尔也能合并，变成 3 次挥手，但标准流程是 4 次。*
+
+### 五、 面试/实战中的“必杀技”
+
+#### 1. 关于 TIME_WAIT (2MSL)
+
+你在做 socket 编程时，经常会遇到服务器重启失败，报错 `Address already in use`。
+
+- **原因**：主动关闭方在第 4 次挥手后，会进入 `TIME_WAIT` 状态，持续 **2MSL** (Maximum Segment Lifetime，通常是 2分钟或 30秒)。
+- **为什么**：
+    1. **防丢包**：如果第 4 次的 `ACK` 丢了，Server 会重传 `FIN`。Client 必须还在等着，才能补发 `ACK`。如果 Client 直接 Closed 了，Server 就会收到 RST，报错。
+    2. **防混淆**：等待 2MSL 可以确保本次连接产生的所有旧数据包在网络中彻底消亡。防止新的连接（同样的 IP+Port）被旧的“迷路”数据包干扰。
+- **解法**：在 `bind` 之前设置 `SO_REUSEADDR` 选项。
+
+#### 2. 为什么会有大量的 CLOSE_WAIT？
+
+如果你的线上服务器通过 `netstat` 看到大量的 `CLOSE_WAIT` 状态。
+
+- **原因**：**你的代码有 Bug！**
+- **解释**：`CLOSE_WAIT` 是“被动关闭方”收到 `FIN` 并回复 `ACK` 后的状态。如果你一直处于这个状态，说明 **你的程序没有调用 `close()`**。你可能在读到 `recv == 0`（对方关闭）后，忘记写 `close(fd)` 了。
+
+### 总结
+
+- **三次握手**：是为了在不可靠的网络中，建立可靠的双向连接，并同步序列号。2 次不安全，4 次没必要。
+- **四次挥手**：是因为 TCP 是全双工的，发送和接收需要单独关闭，且服务端有关闭时差。
 
 ### 2.udp并发如何做？
 
